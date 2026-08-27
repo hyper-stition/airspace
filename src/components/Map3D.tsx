@@ -1,829 +1,583 @@
-import React, { useState, useCallback, useMemo, useRef } from 'react';
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import Map, { useControl } from 'react-map-gl/maplibre';
 import { MapboxOverlay } from '@deck.gl/mapbox';
-import { GeoJsonLayer } from '@deck.gl/layers';
+import { GeoJsonLayer, ScatterplotLayer, PathLayer } from '@deck.gl/layers';
 import type { MapboxOverlayProps } from '@deck.gl/mapbox';
 import type { PickingInfo } from '@deck.gl/core';
 import { useAirspaceData } from '../hooks/useAirspaceData';
-import { useIsMobile, useIsTouchDevice, useIsMobileLandscape } from '../hooks/useIsMobile';
-import type { TerminalArea } from '../config/terminalAreas';
+import { useAdsbData, classifyAircraft, getAircraftAltitudeFt } from '../hooks/useAdsbData';
+import { useIsMobile, useIsMobileLandscape } from '../hooks/useIsMobile';
+import type { ProcessedVolume, AdsbAircraft } from '../types/uk-airspace';
+import { ControlPanel } from './ControlPanel';
 import { InfoPanel } from './InfoPanel';
-import { Legend } from './Legend';
-import { AirspaceProfile } from './AirspaceProfile';
-import { AltitudeScale } from './AltitudeScale';
-import { BrowserNotice } from './BrowserNotice';
-import { TerminalAreaSelector } from './TerminalAreaSelector';
-import { MobileMenu } from './MobileMenu';
-import { formatAltitude } from '../utils/altitudeUtils';
-import { getOutlineColor, HIGHLIGHT_COLORS } from '../utils/colorUtils';
-import type { ProcessedAirspace } from '../types/airspace';
+import { AdsbPanel } from './AdsbPanel';
+import {
+  CATEGORY_COLORS, HIGHLIGHT_COLORS, AIRCRAFT_COLORS, getCategoryEdge,
+  type VisualMode,
+} from '../utils/colorUtils';
+import { feetToMeters } from '../utils/altitudeParser';
+import { LONDON_AERODROMES } from '../data/london-aerodromes';
+import { HELICOPTER_ROUTES } from '../data/helicopter-routes';
+import type { ExaggerationValue } from '../config/london';
+import {
+  DEFAULT_VIEW_STATE, CAMERA_PRESETS,
+} from '../config/london';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
-// Get initial view for a terminal area
-function getInitialView(area: TerminalArea) {
+// ---- Bake a floor Z (metres) into all polygon vertex coordinates ----
+// GeoJsonLayer ignores getPosition for polygon features. The only way to
+// make extruded polygons float above Z=0 is to set Z on every vertex.
+function withBaseZ(
+  geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon,
+  baseZ: number,
+): GeoJSON.Polygon | GeoJSON.MultiPolygon {
+  const addZ = (ring: number[][]): number[][] => ring.map(([lon, lat]) => [lon, lat, baseZ]);
+  if (geometry.type === 'Polygon') {
+    return { ...geometry, coordinates: geometry.coordinates.map(addZ) };
+  }
   return {
-    longitude: area.centerLng,
-    latitude: area.centerLat,
-    zoom: 8.5,
-    pitch: 55,
-    bearing: -20,
+    ...geometry,
+    coordinates: (geometry as GeoJSON.MultiPolygon).coordinates.map(poly => poly.map(addZ)),
   };
 }
 
-// Vertical exaggeration factor - makes altitude differences visible
-const ALTITUDE_EXAGGERATION = 16.7;
-
-// deck.gl overlay component using react-map-gl's useControl hook
+// ---- DeckGL overlay using react-map-gl useControl ----
 function DeckGLOverlay(props: MapboxOverlayProps) {
-  const overlay = useControl(() => new MapboxOverlay(props));
+  const overlay = useControl<MapboxOverlay>(() => new MapboxOverlay(props));
   overlay.setProps(props);
   return null;
 }
 
-interface HoverInfo {
-  x: number;
-  y: number;
-  object: ProcessedAirspace;
-}
+// ---- Dark base map style (CARTO Dark Matter - free, no API key) ----
+const MAP_STYLE = {
+  version: 8 as const,
+  sources: {
+    'carto-dark': {
+      type: 'raster' as const,
+      tiles: [
+        'https://a.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}@2x.png',
+        'https://b.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}@2x.png',
+        'https://c.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}@2x.png',
+      ],
+      tileSize: 256,
+      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
+    },
+  },
+  layers: [{
+    id: 'carto-dark-layer',
+    type: 'raster' as const,
+    source: 'carto-dark',
+    minzoom: 0,
+    maxzoom: 22,
+  }],
+};
 
-interface Map3DProps {
-  terminalArea: TerminalArea;
-}
+// ---- Layer visibility state type ----
+type LayerKey =
+  | 'TMA' | 'CTA' | 'CTR' | 'ATZ'
+  | 'RESTRICTED' | 'PROHIBITED' | 'DANGER'
+  | 'HELICOPTER_ROUTE'
+  | 'UAS_FRZ' | 'UAS_OTHER'
+  | 'AERODROME'
+  | 'ADSB_ALL' | 'ADSB_HELICOPTERS' | 'ADSB_JETS' | 'ADSB_TRAILS';
 
-export function Map3D({ terminalArea }: Map3DProps) {
-  const { data, loading, error } = useAirspaceData(terminalArea);
-  const [selectedAirspace, setSelectedAirspace] = useState<ProcessedAirspace | null>(null);
-  const [hoveredAirspace, setHoveredAirspace] = useState<ProcessedAirspace | null>(null);
-  const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
-  const [showClassE, setShowClassE] = useState(false);
-  const [showHelpOverlay, setShowHelpOverlay] = useState(true);
-  const [viewState, setViewState] = useState(getInitialView(terminalArea));
+const DEFAULT_LAYER_VISIBILITY: Record<LayerKey, boolean> = {
+  TMA: true, CTA: true, CTR: true, ATZ: true,
+  RESTRICTED: true, PROHIBITED: true, DANGER: true,
+  HELICOPTER_ROUTE: true,
+  UAS_FRZ: true, UAS_OTHER: true,
+  AERODROME: true,
+  ADSB_ALL: false,
+  ADSB_HELICOPTERS: false, ADSB_JETS: false,
+  ADSB_TRAILS: false,
+};
 
-  // Responsive hooks
+type SliceMode = 'INTERSECT' | 'CUTAWAY';
+
+export function Map3D() {
+  // Rendering controls
+  const [mode, setMode] = useState<VisualMode>('HITBOX');
+  const [opacity, setOpacity] = useState(1.0);
+  const [exaggeration, setExaggeration] = useState<ExaggerationValue>(5);
+  const [is3D, setIs3D] = useState(true);
+
+  // Altitude slice
+  const [sliceAlt, setSliceAlt] = useState<number | null>(null);
+  const [sliceMode, setSliceMode] = useState<SliceMode>('INTERSECT');
+  const [minAlt, setMinAlt] = useState(0);
+  const [maxAlt, setMaxAlt] = useState(60000);
+
+  // Layer visibility
+  const [layers, setLayers] = useState(DEFAULT_LAYER_VISIBILITY);
+
+  // ADS-B enabled when any ADSB layer is on
+  const adsbEnabled = layers.ADSB_ALL || layers.ADSB_HELICOPTERS || layers.ADSB_JETS;
+
+  // Selection/hover
+  const [selectedVolume, setSelectedVolume] = useState<ProcessedVolume | null>(null);
+  const [selectedAircraft, setSelectedAircraft] = useState<AdsbAircraft | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; label: string } | null>(null);
+
+  // View state
+  type VS = { longitude: number; latitude: number; zoom: number; pitch: number; bearing: number };
+  const [viewState, setViewState] = useState<VS>(DEFAULT_VIEW_STATE as VS);
+
+  // Camera preset flyto
+  const [flyTo, setFlyTo] = useState<VS | null>(null);
+
+  // Responsive
   const isMobile = useIsMobile();
-  const isTouch = useIsTouchDevice();
   const isMobileLandscape = useIsMobileLandscape();
+  const isMobileAny = isMobile || isMobileLandscape;
 
-  // Reset view when terminal area changes
-  React.useEffect(() => {
-    setViewState(getInitialView(terminalArea));
-    setSelectedAirspace(null);
-    setHoveredAirspace(null);
-  }, [terminalArea]);
+  // Data
+  const { volumes, manifest, loading, error } = useAirspaceData({ mode, opacity, exaggeration });
+  const { aircraft, lastUpdated } = useAdsbData(adsbEnabled);
 
-  // Track if deck.gl handled a click (to prevent map onClick from clearing selection)
+  // Prevent map click from clearing selection when deck.gl handled it
   const deckClickHandled = useRef(false);
 
-  const handleClick = useCallback((info: PickingInfo) => {
+  // Apply flyTo when set
+  useEffect(() => {
+    if (flyTo) {
+      setViewState(flyTo);
+      setFlyTo(null);
+    }
+  }, [flyTo]);
+
+  // ---- Toggle helpers ----
+  const toggleLayer = useCallback((key: LayerKey) => {
+    setLayers(prev => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const toggleMode = useCallback((m: VisualMode) => setMode(m), []);
+
+  // ---- Filter volumes by category + altitude ----
+  const visibleVolumes = useMemo(() => {
+    return volumes.filter(vol => {
+      // Category filter
+      const catKey = vol.category as LayerKey;
+      if (!(catKey in layers)) {
+        // Map sub-categories
+        if (vol.category === 'UAS_FRZ' && !layers.UAS_FRZ) return false;
+        if (vol.category === 'UAS_OTHER' && !layers.UAS_OTHER) return false;
+        if (vol.category === 'HELICOPTER_ROUTE' && !layers.HELICOPTER_ROUTE) return false;
+      } else {
+        if (!layers[catKey]) return false;
+      }
+
+      const floorFt = vol.lower.renderFeet;
+      const ceilFt = vol.upper.renderFeet;
+
+      // Min/max altitude filter
+      if (ceilFt < minAlt || floorFt > maxAlt) return false;
+
+      // Altitude slice filter
+      if (sliceAlt !== null) {
+        if (sliceMode === 'INTERSECT') {
+          return floorFt <= sliceAlt && ceilFt >= sliceAlt;
+        }
+        // CUTAWAY: show volumes below the slice
+        if (sliceMode === 'CUTAWAY') {
+          return floorFt <= sliceAlt;
+        }
+      }
+
+      return true;
+    });
+  }, [volumes, layers, minAlt, maxAlt, sliceAlt, sliceMode]);
+
+  // Sort by floor for correct render order
+  const sortedVolumes = useMemo(
+    () => [...visibleVolumes].sort((a, b) => a.lower.renderFeet - b.lower.renderFeet),
+    [visibleVolumes],
+  );
+
+  // ---- Filter aircraft ----
+  const visibleAircraft = useMemo(() => {
+    if (!adsbEnabled) return [];
+    return aircraft.filter(ac => {
+      const cls = classifyAircraft(ac);
+      if (layers.ADSB_ALL) return true;
+      if (layers.ADSB_HELICOPTERS && cls === 'helicopter') return true;
+      if (layers.ADSB_JETS && cls === 'jet') return true;
+      return false;
+    });
+  }, [aircraft, adsbEnabled, layers]);
+
+  // ---- Helicopter route geometries ----
+  const heliRoutes = useMemo(() => {
+    if (!layers.HELICOPTER_ROUTE) return [];
+    return HELICOPTER_ROUTES.map(seg => ({
+      ...seg,
+      path: seg.coordinates,
+      color: CATEGORY_COLORS.HELICOPTER_ROUTE.edge,
+      width: 3,
+    }));
+  }, [layers.HELICOPTER_ROUTE]);
+
+  // ---- Aerodrome markers ----
+  const aerodromeData = useMemo(() => {
+    if (!layers.AERODROME) return [];
+    return LONDON_AERODROMES.map(a => ({
+      ...a,
+      position: [a.lon, a.lat, feetToMeters(a.elevationFt) * exaggeration],
+      color: CATEGORY_COLORS.AERODROME.edge,
+    }));
+  }, [layers.AERODROME, exaggeration]);
+
+  // ---- Aircraft 3D positions ----
+  const aircraftData = useMemo(() => {
+    return visibleAircraft.map(ac => {
+      const altFt = getAircraftAltitudeFt(ac) ?? 0;
+      const cls = classifyAircraft(ac);
+      const altM = feetToMeters(altFt) * exaggeration;
+      return {
+        ...ac,
+        position: [ac.lon!, ac.lat!, is3D ? altM : 0],
+        color: AIRCRAFT_COLORS[cls],
+        radius: 300,
+      };
+    });
+  }, [visibleAircraft, exaggeration, is3D]);
+
+  // ---- Click handlers ----
+  const handleVolumeClick = useCallback((info: PickingInfo) => {
     deckClickHandled.current = true;
     if (info.object) {
-      setSelectedAirspace(info.object as ProcessedAirspace);
+      setSelectedVolume(info.object as ProcessedVolume);
+      setSelectedAircraft(null);
+    }
+  }, []);
+
+  const handleAircraftClick = useCallback((info: PickingInfo) => {
+    deckClickHandled.current = true;
+    if (info.object) {
+      setSelectedAircraft(info.object as AdsbAircraft);
+      setSelectedVolume(null);
     }
   }, []);
 
   const handleMapClick = useCallback(() => {
-    // Only clear selection if deck.gl didn't handle the click
     if (!deckClickHandled.current) {
-      setSelectedAirspace(null);
+      setSelectedVolume(null);
+      setSelectedAircraft(null);
     }
     deckClickHandled.current = false;
   }, []);
 
   const handleHover = useCallback((info: PickingInfo) => {
     if (info.object) {
-      const obj = info.object as ProcessedAirspace;
-      setHoveredAirspace(obj);
-      setHoverInfo({
-        x: info.x,
-        y: info.y,
-        object: obj,
-      });
+      const vol = info.object as ProcessedVolume;
+      const name = vol.name || (info.object as AdsbAircraft).flight || '';
+      setHoverInfo({ x: info.x, y: info.y, label: name });
     } else {
-      setHoveredAirspace(null);
       setHoverInfo(null);
     }
   }, []);
 
-  const handleProfileClick = useCallback((airspace: ProcessedAirspace) => {
-    setSelectedAirspace(airspace);
-  }, []);
+  // ---- Build deck.gl layers ----
+  const selectedId = selectedVolume?.id;
 
-  const handleProfileHover = useCallback((airspace: ProcessedAirspace | null) => {
-    setHoveredAirspace(airspace);
-  }, []);
+  const deckLayers = useMemo(() => {
+    const result = [];
 
-  // Sort airspaces by altitude for proper rendering order (lower floors first = rendered first = behind)
-  // Filter out Class E unless showClassE is enabled
-  const sortedData = useMemo(() => {
-    if (!data) return [];
-    const filtered = showClassE ? data : data.filter(d => d.properties.CLASS !== 'E');
-    return [...filtered].sort((a, b) => a.floorMeters - b.floorMeters);
-  }, [data, showClassE]);
-
-  const layers = useMemo(() => {
-    if (!sortedData.length) return [];
-
-    const selectedId = selectedAirspace?.properties.OBJECTID;
-    const hoveredId = hoveredAirspace?.properties.OBJECTID;
-
-    // Base layer - solid filled polygons for each airspace volume
-    // @ts-expect-error deck.gl 9.x has complex generic types
-    const fillLayer = new GeoJsonLayer({
-        id: 'airspace-fill-layer',
-        data: {
-          type: 'FeatureCollection',
-          features: sortedData,
-        },
+    // 1. Airspace fill layer
+    if (sortedVolumes.length > 0) {
+      result.push(new GeoJsonLayer({
+        id: 'airspace-fill',
+        data: { type: 'FeatureCollection', features: sortedVolumes.map(v => ({
+          type: 'Feature',
+          // In 3D mode: bake floorMeters as Z on every vertex so the polygon
+          // base floats at the correct altitude. GeoJsonLayer reads vertex Z
+          // as the base when extruded=true. getPosition is NOT valid here.
+          geometry: is3D ? withBaseZ(v.geometry, v.floorMeters) : v.geometry,
+          properties: v,
+        })) },
         pickable: true,
         stroked: false,
         filled: true,
-        extruded: true,
+        extruded: is3D,
         wireframe: false,
-
-        // 3D configuration
-        getElevation: (d: ProcessedAirspace) => d.extrusionHeight * ALTITUDE_EXAGGERATION,
+        getElevation: (d: { properties: ProcessedVolume }) => {
+          if (!is3D) return 0;
+          return d.properties.extrusionMeters;
+        },
         elevationScale: 1,
-
-        // Solid fill with class-based color
-        getFillColor: (d: ProcessedAirspace) => {
-          const isSelected = d.properties.OBJECTID === selectedId;
-          const isHovered = d.properties.OBJECTID === hoveredId;
-
-          if (isSelected) {
-            return HIGHLIGHT_COLORS.selected;
-          }
-          if (isHovered) {
-            return HIGHLIGHT_COLORS.hover;
-          }
-
-          // Use the airspace color with adjusted opacity based on class
-          const baseColor = d.color;
-          // Make Class B more visible, others slightly more transparent
-          const classOpacity: Record<string, number> = {
-            B: 100,
-            C: 80,
-            D: 70,
-            E: 50,
-          };
-          const opacity = classOpacity[d.properties.CLASS] || 60;
-
-          return [baseColor[0], baseColor[1], baseColor[2], opacity] as [number, number, number, number];
+        getFillColor: (d: { properties: ProcessedVolume }) => {
+          if (d.properties.id === selectedId) return HIGHLIGHT_COLORS.selected;
+          return d.properties.color;
         },
-
-        // Material for better 3D appearance
         material: {
-          ambient: 0.6,
-          diffuse: 0.8,
-          shininess: 32,
-          specularColor: [60, 64, 70],
+          ambient: 0.5,
+          diffuse: 0.7,
+          shininess: 20,
+          specularColor: [40, 50, 60],
         },
-
-        // Interactivity
-        onClick: handleClick,
+        onClick: handleVolumeClick,
         onHover: handleHover,
-
-        // Auto-highlight disabled - we handle highlighting manually via getFillColor
-        autoHighlight: false,
-
-        // Update triggers for selection/hover changes
         updateTriggers: {
-          getFillColor: [selectedId, hoveredId],
+          getFillColor: [selectedId],
+          getElevation: [exaggeration, is3D],
         },
-      });
+        // Polygon offset to float above map at floor altitude
+        parameters: {
+          depthTest: true,
+        },
+      } as unknown as ConstructorParameters<typeof GeoJsonLayer>[0]));
 
-    // Outline layer - crisp edges for each airspace
-    // @ts-expect-error deck.gl 9.x has complex generic types
-    const outlineLayer = new GeoJsonLayer({
-        id: 'airspace-outline-layer',
-        data: {
-          type: 'FeatureCollection',
-          features: sortedData,
-        },
+      // 2. Airspace wireframe/edge layer
+      result.push(new GeoJsonLayer({
+        id: 'airspace-wireframe',
+        data: { type: 'FeatureCollection', features: sortedVolumes.map(v => ({
+          type: 'Feature',
+          geometry: is3D ? withBaseZ(v.geometry, v.floorMeters) : v.geometry,
+          properties: v,
+        })) },
         pickable: false,
         stroked: true,
         filled: false,
-        extruded: true,
+        extruded: is3D,
         wireframe: true,
-
-        getElevation: (d: ProcessedAirspace) => d.extrusionHeight * ALTITUDE_EXAGGERATION,
+        lineWidthMinPixels: mode === 'HITBOX' ? 2 : 1,
+        getElevation: (d: { properties: ProcessedVolume }) => {
+          if (!is3D) return 0;
+          return d.properties.extrusionMeters;
+        },
         elevationScale: 1,
-
-        // Outline styling
-        getLineColor: (d: ProcessedAirspace) => {
-          const isSelected = d.properties.OBJECTID === selectedId;
-          const isHovered = d.properties.OBJECTID === hoveredId;
-
-          if (isSelected) {
-            return [255, 200, 50, 255] as [number, number, number, number];
-          }
-          if (isHovered) {
-            return [255, 230, 150, 255] as [number, number, number, number];
-          }
-
-          return getOutlineColor(d.properties.CLASS);
+        getLineColor: (d: { properties: ProcessedVolume }) => {
+          if (d.properties.id === selectedId) return HIGHLIGHT_COLORS.selectedEdge;
+          return getCategoryEdge(d.properties.category);
         },
-        lineWidthMinPixels: 1,
-        getLineWidth: (d: ProcessedAirspace) => {
-          const isSelected = d.properties.OBJECTID === selectedId;
-          const isHovered = d.properties.OBJECTID === hoveredId;
-          return isSelected ? 80 : isHovered ? 60 : 30;
-        },
-
+        getLineWidth: (d: { properties: ProcessedVolume }) => d.properties.id === selectedId ? 80 : 30,
         updateTriggers: {
-          getLineColor: [selectedId, hoveredId],
-          getLineWidth: [selectedId, hoveredId],
+          getLineColor: [selectedId],
+          getElevation: [exaggeration, is3D],
         },
-      });
+      } as unknown as ConstructorParameters<typeof GeoJsonLayer>[0]));
+    }
 
-    return [fillLayer, outlineLayer];
-  }, [sortedData, selectedAirspace, hoveredAirspace, handleClick, handleHover]);
+    // 3. Helicopter routes
+    if (heliRoutes.length > 0) {
+      result.push(new PathLayer({
+        id: 'helicopter-routes',
+        data: heliRoutes,
+        pickable: false,
+        getPath: (d: typeof heliRoutes[0]) => d.path.map(([lon, lat]) => [lon, lat, is3D ? feetToMeters((d.lower.renderFeet + d.upper.renderFeet) / 2) * exaggeration : 0]),
+        getColor: (d: typeof heliRoutes[0]) => d.color,
+        getWidth: 4,
+        widthMinPixels: 2,
+        widthMaxPixels: 8,
+        capRounded: true,
+        jointRounded: true,
+      } as unknown as ConstructorParameters<typeof PathLayer>[0]));
+    }
 
-  // Create map style with the appropriate sectional chart for this terminal area
-  const mapStyle = useMemo(() => ({
-    version: 8 as const,
-    sources: {
-      'sectional': {
-        type: 'raster' as const,
-        tiles: [
-          'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}'
-        ],
-        tileSize: 256,
-        attribution: 'FAA Aeronautical Charts'
-      }
-    },
-    layers: [
-      {
-        id: 'sectional-layer',
-        type: 'raster' as const,
-        source: 'sectional',
-        minzoom: 0,
-        maxzoom: 12
-      }
-    ]
-  }), []);
+    // 4. Aerodrome markers
+    if (aerodromeData.length > 0) {
+      result.push(new ScatterplotLayer({
+        id: 'aerodromes',
+        data: aerodromeData,
+        pickable: true,
+        getPosition: (d: typeof aerodromeData[0]) => d.position,
+        getFillColor: [80, 220, 80, 200],
+        getRadius: 400,
+        radiusMinPixels: 5,
+        radiusMaxPixels: 20,
+        lineWidthMinPixels: 2,
+        stroked: true,
+        getLineColor: [100, 255, 100, 255],
+        onClick: handleVolumeClick,
+        onHover: handleHover,
+      } as unknown as ConstructorParameters<typeof ScatterplotLayer>[0]));
+    }
 
-  // Responsive layout: hide profile and altitude scale on mobile (portrait or landscape)
-  const showProfile = !isMobile && !isMobileLandscape;
-  const showAltitudeScale = !isMobile && !isMobileLandscape;
-  const show3D = true;
+    // 5. Aircraft scatter
+    if (aircraftData.length > 0) {
+      result.push(new ScatterplotLayer({
+        id: 'aircraft',
+        data: aircraftData,
+        pickable: true,
+        getPosition: (d: typeof aircraftData[0]) => d.position,
+        getFillColor: (d: typeof aircraftData[0]) => d.color,
+        getRadius: (d: typeof aircraftData[0]) => d.radius,
+        radiusMinPixels: 4,
+        radiusMaxPixels: 16,
+        stroked: true,
+        getLineColor: [255, 255, 255, 180],
+        lineWidthMinPixels: 1,
+        onClick: handleAircraftClick,
+        onHover: handleHover,
+      } as unknown as ConstructorParameters<typeof ScatterplotLayer>[0]));
+    }
 
-  // Combine mobile states for simpler conditionals
-  const isMobileAny = isMobile || isMobileLandscape;
+    return result;
+  }, [
+    sortedVolumes, heliRoutes, aerodromeData, aircraftData,
+    is3D, mode, exaggeration, selectedId,
+    handleVolumeClick, handleAircraftClick, handleHover,
+  ]);
 
   return (
-    <div style={{ width: '100vw', height: '100vh', position: 'relative', background: 'var(--bg-primary)' }}>
-      {/* Map container */}
-      {show3D && (
-        <Map
-          {...viewState}
-          onMove={(evt: { viewState: typeof viewState }) => setViewState(evt.viewState)}
-          onClick={handleMapClick}
-          maxPitch={85}
-          minPitch={0}
-          mapStyle={mapStyle}
-        >
-          <DeckGLOverlay layers={layers} interleaved />
-        </Map>
-      )}
+    <div style={{ width: '100vw', height: '100vh', position: 'relative', background: '#0a0e14' }}>
 
-      {/* Terminal Area Selector - upper left */}
-      <div
-        style={{
-          position: 'absolute',
-          top: 16,
-          left: 16,
-          zIndex: 100,
-        }}
+      {/* Base map + deck.gl */}
+      <Map
+        {...viewState}
+        onMove={evt => setViewState(evt.viewState)}
+        onClick={handleMapClick}
+        maxPitch={85}
+        minPitch={0}
+        mapStyle={MAP_STYLE}
       >
-        <TerminalAreaSelector selectedArea={terminalArea} />
-      </div>
+        <DeckGLOverlay layers={deckLayers} interleaved />
+      </Map>
 
-      {/* Title - compact dark box, centered (hidden on mobile and narrow screens to prevent overlap) */}
-      {!isMobileAny && (
-        <div
-          className="desktop-title"
-          style={{
-            position: 'absolute',
-            top: 16,
-            left: '50%',
-            transform: 'translateX(-50%)',
-            textAlign: 'center',
-            background: 'rgba(15, 23, 42, 0.9)',
-            backdropFilter: 'blur(8px)',
-            padding: '8px 16px',
-            borderRadius: '6px',
-            border: '1px solid rgba(255, 255, 255, 0.1)',
-            zIndex: 100,
-          }}
-        >
-          <style>{`
-            @media (max-width: 1100px) {
-              .desktop-title {
-                display: none !important;
-              }
-            }
-          `}</style>
-          <h1
-            style={{
-              fontSize: '15px',
-              fontWeight: 600,
-              color: '#f8fafc',
-              letterSpacing: '-0.01em',
-              margin: 0,
-            }}
-          >
-            {terminalArea.name} Airspace
-          </h1>
-          <p
-            className="mono"
-            style={{
-              fontSize: '10px',
-              color: 'rgba(148, 163, 184, 0.9)',
-              marginTop: '2px',
-              letterSpacing: '0.05em',
-              textTransform: 'uppercase',
-            }}
-          >
-            {terminalArea.id} • 3D Visualization
-          </p>
-        </div>
-      )}
+      {/* ---- Control Panel (left side) ---- */}
+      <ControlPanel
+        mode={mode}
+        onModeChange={toggleMode}
+        opacity={opacity}
+        onOpacityChange={setOpacity}
+        exaggeration={exaggeration}
+        onExaggerationChange={setExaggeration}
+        is3D={is3D}
+        onToggle3D={() => setIs3D(v => !v)}
+        layers={layers}
+        onToggleLayer={toggleLayer}
+        sliceAlt={sliceAlt}
+        onSliceAltChange={setSliceAlt}
+        sliceMode={sliceMode}
+        onSliceModeChange={setSliceMode}
+        minAlt={minAlt}
+        onMinAltChange={setMinAlt}
+        maxAlt={maxAlt}
+        onMaxAltChange={setMaxAlt}
+        manifest={manifest}
+        onCameraPreset={preset => {
+          const p = CAMERA_PRESETS.find(c => c.id === preset);
+          if (p) setFlyTo({ ...p.view });
+        }}
+        isMobile={isMobileAny}
+      />
 
-      {/* Hover tooltip - hidden on mobile when airspace is selected */}
-      {hoverInfo && show3D && !(isMobileAny && selectedAirspace) && (
+      {/* ---- Hover tooltip ---- */}
+      {hoverInfo && !(isMobileAny && (selectedVolume || selectedAircraft)) && (
         <div
-          className="glass-panel animate-fade-in"
           style={{
             position: 'absolute',
             left: hoverInfo.x + 12,
             top: hoverInfo.y + 12,
-            padding: '10px 14px',
+            padding: '8px 12px',
+            background: 'rgba(10, 14, 20, 0.92)',
+            border: '1px solid rgba(148, 163, 184, 0.2)',
+            borderRadius: '8px',
+            fontSize: '12px',
+            color: '#f1f5f9',
+            fontFamily: 'var(--font-sans)',
             pointerEvents: 'none',
-            zIndex: 1000,
-            maxWidth: '280px',
+            zIndex: 500,
+            backdropFilter: 'blur(8px)',
+            maxWidth: 240,
           }}
         >
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              marginBottom: '6px',
-            }}
-          >
-            <div className={`class-badge ${hoverInfo.object.properties.CLASS}`}>
-              {hoverInfo.object.properties.CLASS}
-            </div>
-            <strong
-              style={{
-                fontSize: '14px',
-                color: '#ffffff',
-                fontWeight: 600,
-                fontFamily: 'var(--font-sans)',
-              }}
-            >
-              {hoverInfo.object.properties.NAME}
-            </strong>
-          </div>
-          <div
-            style={{
-              fontSize: '13px',
-              fontWeight: 500,
-              color: '#e2e8f0',
-              fontFamily: 'var(--font-sans)',
-            }}
-          >
-            {formatAltitude(hoverInfo.object.properties.LOWER_VAL, hoverInfo.object.properties.LOWER_CODE)}
-            {' → '}
-            {formatAltitude(hoverInfo.object.properties.UPPER_VAL, hoverInfo.object.properties.UPPER_CODE)}
-          </div>
+          {hoverInfo.label}
         </div>
       )}
 
-      {/* Right-side panel: Action buttons + Profile view - horizontally aligned */}
-      {showProfile && data && (
-        <div
-          style={{
-            position: 'absolute',
-            right: 16,
-            top: 16,
-            display: 'flex',
-            flexDirection: 'row',
-            alignItems: 'flex-start',
-            gap: '12px',
-            zIndex: 100,
-          }}
-        >
-          {/* Action buttons - horizontal row */}
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'row',
-              gap: '8px',
-              paddingTop: '2px',
-            }}
-          >
-            <button
-              onClick={() => setShowHelpOverlay(true)}
-              className="glass-panel"
-              style={{
-                padding: '8px 14px',
-                fontSize: '11px',
-                fontWeight: 500,
-                color: 'var(--text-secondary)',
-                background: 'var(--bg-glass)',
-                border: '1px solid var(--border-subtle)',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                transition: 'all 0.15s ease',
-                textTransform: 'uppercase',
-                letterSpacing: '0.03em',
-                whiteSpace: 'nowrap',
-              }}
-              onMouseEnter={(e: React.MouseEvent<HTMLButtonElement>) => {
-                e.currentTarget.style.background = 'rgba(255, 255, 255, 0.12)';
-                e.currentTarget.style.color = 'var(--text-primary)';
-              }}
-              onMouseLeave={(e: React.MouseEvent<HTMLButtonElement>) => {
-                e.currentTarget.style.background = 'var(--bg-glass)';
-                e.currentTarget.style.color = 'var(--text-secondary)';
-              }}
-            >
-              Help
-            </button>
-            <a
-              href="https://github.com/L13w/airspace"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="glass-panel"
-              style={{
-                padding: '8px 14px',
-                fontSize: '11px',
-                fontWeight: 500,
-                color: 'var(--text-secondary)',
-                background: 'var(--bg-glass)',
-                border: '1px solid var(--border-subtle)',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                textDecoration: 'none',
-                transition: 'all 0.15s ease',
-                textTransform: 'uppercase',
-                letterSpacing: '0.03em',
-                whiteSpace: 'nowrap',
-              }}
-              onMouseEnter={(e: React.MouseEvent<HTMLAnchorElement>) => {
-                e.currentTarget.style.background = 'rgba(255, 255, 255, 0.12)';
-                e.currentTarget.style.color = 'var(--text-primary)';
-              }}
-              onMouseLeave={(e: React.MouseEvent<HTMLAnchorElement>) => {
-                e.currentTarget.style.background = 'var(--bg-glass)';
-                e.currentTarget.style.color = 'var(--text-secondary)';
-              }}
-            >
-              Code & Docs
-            </a>
-          </div>
-
-          {/* Profile view - inline */}
-          <AirspaceProfile
-            key={`profile-${terminalArea.id}`}
-            airspaces={data}
-            selectedAirspace={selectedAirspace}
-            hoveredAirspace={hoveredAirspace}
-            onAirspaceClick={handleProfileClick}
-            onAirspaceHover={handleProfileHover}
-            airportCode={terminalArea.id}
-          />
-        </div>
-      )}
-
-      {/* Mobile-only hamburger menu - top right */}
-      {isMobileAny && (
-        <MobileMenu onShowHelp={() => setShowHelpOverlay(true)} />
-      )}
-
-      {/* Altitude scale - hidden on mobile */}
-      {showAltitudeScale && data && (
-        <AltitudeScale
-          key={`scale-${terminalArea.id}`}
-          airspaces={data}
-          selectedAirspace={selectedAirspace}
-          hoveredAirspace={hoveredAirspace}
+      {/* ---- Info panel for selected volume ---- */}
+      {selectedVolume && (
+        <InfoPanel
+          volume={selectedVolume}
+          onClose={() => setSelectedVolume(null)}
+          isMobile={isMobileAny}
         />
       )}
 
-      {/* Side panel for selected airspace */}
-      <InfoPanel
-        airspace={selectedAirspace}
-        onClose={() => setSelectedAirspace(null)}
-      />
+      {/* ---- ADS-B aircraft detail ---- */}
+      {selectedAircraft && (
+        <AdsbPanel
+          aircraft={selectedAircraft}
+          exaggeration={exaggeration}
+          onClose={() => setSelectedAircraft(null)}
+          isMobile={isMobileAny}
+        />
+      )}
 
-      {/* Legend - hidden on mobile */}
-      {show3D && !isMobileAny && <Legend compact={!!selectedAirspace} showClassE={showClassE} onShowClassEChange={setShowClassE} />}
+      {/* ---- ADS-B status indicator ---- */}
+      {adsbEnabled && (
+        <div style={{
+          position: 'absolute',
+          bottom: isMobileAny ? 56 : 20,
+          right: 16,
+          fontSize: '10px',
+          color: 'rgba(148, 163, 184, 0.7)',
+          fontFamily: 'var(--font-mono)',
+          zIndex: 100,
+          textAlign: 'right',
+        }}>
+          <span style={{ color: '#22c55e' }}>●</span>{' '}
+          ADS-B {visibleAircraft.length} ac{' '}
+          {lastUpdated ? `· ${lastUpdated.toLocaleTimeString()}` : ''}
+        </div>
+      )}
 
-      {/* Loading overlay */}
+      {/* ---- Loading overlay ---- */}
       {loading && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'var(--bg-glass)',
-            backdropFilter: 'blur(8px)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 2000,
-          }}
-        >
-          <div
-            style={{
-              width: '40px',
-              height: '40px',
-              border: '3px solid var(--border-subtle)',
-              borderTopColor: 'var(--class-b)',
-              borderRadius: '50%',
-              animation: 'spin 1s linear infinite',
-              marginBottom: '16px',
-            }}
-          />
-          <style>{`
-            @keyframes spin {
-              to { transform: rotate(360deg); }
-            }
-          `}</style>
-          <span
-            style={{
-              fontSize: '14px',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            Loading airspace data...
-          </span>
-        </div>
-      )}
-
-      {/* Error message */}
-      {error && (
-        <div
-          className="glass-panel"
-          style={{
-            position: 'absolute',
-            top: '50%',
-            left: '50%',
-            transform: 'translate(-50%, -50%)',
-            padding: '24px 32px',
-            textAlign: 'center',
-            zIndex: 2000,
-            border: '1px solid rgba(239, 68, 68, 0.3)',
-          }}
-        >
-          <div
-            style={{
-              width: '48px',
-              height: '48px',
-              borderRadius: '50%',
-              background: 'rgba(239, 68, 68, 0.1)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              margin: '0 auto 16px',
-            }}
-          >
-            <span style={{ fontSize: '24px', color: 'var(--accent-red)' }}>!</span>
-          </div>
-          <div
-            style={{
-              fontSize: '14px',
-              fontWeight: 500,
-              color: 'var(--text-primary)',
-              marginBottom: '8px',
-            }}
-          >
-            Failed to load airspace
-          </div>
-          <div
-            style={{
-              fontSize: '12px',
-              color: 'var(--text-muted)',
-            }}
-          >
-            {error.message}
-          </div>
-        </div>
-      )}
-
-      {/* Help overlay - responsive for touch/mouse */}
-      {showHelpOverlay && !loading && (
-        <div
-          onClick={() => setShowHelpOverlay(false)}
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'rgba(0, 0, 0, 0.65)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 3000,
-            cursor: 'pointer',
-            padding: isMobileAny ? '1rem' : 0,
-          }}
-        >
-          {/* Touch gestures for mobile */}
-          {isTouch ? (
-            <div style={{
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              gap: '1.5rem',
-              padding: '0 1rem',
-              maxWidth: '320px',
-            }}>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{
-                  fontSize: isMobileAny ? '1.5rem' : '2rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  marginBottom: '0.25rem',
-                }}>
-                  ☝️ One Finger
-                </div>
-                <div style={{
-                  fontSize: isMobileAny ? '1rem' : '1.25rem',
-                  color: 'rgba(255, 255, 255, 0.7)',
-                }}>
-                  Pan the map
-                </div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{
-                  fontSize: isMobileAny ? '1.5rem' : '2rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  marginBottom: '0.25rem',
-                }}>
-                  ✌️ Two Fingers
-                </div>
-                <div style={{
-                  fontSize: isMobileAny ? '1rem' : '1.25rem',
-                  color: 'rgba(255, 255, 255, 0.7)',
-                }}>
-                  Pinch to zoom, drag up/down to tilt,
-                  <br />
-                  twist to rotate
-                </div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{
-                  fontSize: isMobileAny ? '1.5rem' : '2rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  marginBottom: '0.25rem',
-                }}>
-                  👆 Tap
-                </div>
-                <div style={{
-                  fontSize: isMobileAny ? '1rem' : '1.25rem',
-                  color: 'rgba(255, 255, 255, 0.7)',
-                }}>
-                  Select airspace
-                </div>
-              </div>
-            </div>
-          ) : (
-            /* Mouse controls for desktop */
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: '1fr 1.2fr 1fr',
-              alignItems: 'start',
-              gap: '2rem',
-              padding: '0 8%',
-              width: '100%',
-              maxWidth: '1400px',
-            }}>
-              <div style={{ textAlign: 'center', justifySelf: 'end', paddingRight: '2rem' }}>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Left Click
-                </div>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Drag
-                </div>
-              </div>
-              <div style={{ textAlign: 'center', justifySelf: 'center' }}>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Mouse Wheel
-                </div>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Zoom In/Out
-                </div>
-              </div>
-              <div style={{ textAlign: 'center', justifySelf: 'start', paddingLeft: '2rem' }}>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Right Click
-                </div>
-                <div style={{
-                  fontSize: '2.5rem',
-                  fontWeight: 600,
-                  color: 'rgba(255, 255, 255, 0.9)',
-                  textShadow: '0 2px 12px rgba(0, 0, 0, 0.6)',
-                  lineHeight: 1.3,
-                }}>
-                  Rotate and Tilt
-                </div>
-              </div>
-            </div>
-          )}
+        <div style={{
+          position: 'absolute', inset: 0,
+          background: 'rgba(10, 14, 20, 0.85)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          zIndex: 2000,
+        }}>
           <div style={{
-            fontSize: isMobileAny ? '0.875rem' : '1rem',
-            fontWeight: 500,
-            color: 'rgba(255, 255, 255, 0.7)',
-            textShadow: '0 2px 8px rgba(0, 0, 0, 0.5)',
-            marginTop: '2rem',
-            textAlign: 'center',
-          }}>
-            {isTouch ? 'Tap anywhere to dismiss' : 'Click anywhere to dismiss'}
-          </div>
+            width: 40, height: 40,
+            border: '3px solid rgba(148, 163, 184, 0.2)',
+            borderTopColor: '#3b82f6',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite',
+            marginBottom: 16,
+          }} />
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          <span style={{ fontSize: 14, color: '#94a3b8' }}>Loading airspace data…</span>
         </div>
       )}
 
-      {/* Browser compatibility notice */}
-      <BrowserNotice />
+      {/* ---- Error state ---- */}
+      {error && !loading && (
+        <div style={{
+          position: 'absolute', top: '50%', left: '50%',
+          transform: 'translate(-50%, -50%)',
+          background: 'rgba(10, 14, 20, 0.95)',
+          border: '1px solid rgba(239, 68, 68, 0.4)',
+          borderRadius: 12, padding: '24px 32px',
+          textAlign: 'center', zIndex: 2000,
+          color: '#f1f5f9', fontFamily: 'var(--font-sans)',
+        }}>
+          <div style={{ fontSize: 24, marginBottom: 12, color: '#ef4444' }}>⚠</div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Failed to load airspace</div>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 8 }}>{error.message}</div>
+        </div>
+      )}
 
-      {/* Copyright notice at bottom - fixed position to escape map stacking context */}
-      <div
-        style={{
-          position: 'fixed',
-          bottom: isMobileAny ? 'calc(env(safe-area-inset-bottom, 0px) + 8px)' : 16,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          fontSize: '11px',
-          color: 'rgba(255, 255, 255, 0.9)',
-          zIndex: 1000,
-          textShadow: '0 1px 4px rgba(0, 0, 0, 0.9), 0 0 8px rgba(0, 0, 0, 0.6)',
-          fontWeight: 500,
-          pointerEvents: 'auto',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        © 2026{' '}
-        <a
-          href="mailto:Llew Roberts <llew@llew.net>"
-          style={{
-            color: 'rgba(255, 255, 255, 0.9)',
-            textDecoration: 'none',
-            transition: 'color 0.15s ease',
-          }}
-          onMouseEnter={(e: React.MouseEvent<HTMLAnchorElement>) => {
-            e.currentTarget.style.color = '#ffffff';
-            e.currentTarget.style.textDecoration = 'underline';
-          }}
-          onMouseLeave={(e: React.MouseEvent<HTMLAnchorElement>) => {
-            e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)';
-            e.currentTarget.style.textDecoration = 'none';
-          }}
-        >
-          Inertial Navigation LLC
-        </a>
+      {/* ---- Safety notice (bottom center) ---- */}
+      <div style={{
+        position: 'fixed',
+        bottom: isMobileAny ? 6 : 8,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        fontSize: isMobileAny ? '9px' : '10px',
+        color: 'rgba(148, 163, 184, 0.6)',
+        fontFamily: 'var(--font-sans)',
+        zIndex: 1000,
+        textAlign: 'center',
+        pointerEvents: 'none',
+        whiteSpace: 'nowrap',
+        textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+      }}>
+        FOR VISUALISATION ONLY · NOT FOR NAVIGATION OR FLIGHT PLANNING
       </div>
     </div>
   );

@@ -1,0 +1,32 @@
+{
+  "source": "NATS_AIP",
+  "sourceFilenames": [
+    "EG_AIS_DS_FULL_20260806_KML.zip",
+    "EG_AIP_DS_FULL_20260806.kmz",
+    "eaip3d.kml"
+  ],
+  "airacDate": "2026-08-06",
+  "generatedAt": "2026-08-27T19:29:18.099848Z",
+  "featureCount": 385,
+  "categoryBreakdown": {
+    "ATZ": 39,
+    "CTA": 51,
+    "CTR": 11,
+    "DANGER": 59,
+    "OTHER": 2,
+    "RESTRICTED": 69,
+    "TMA": 20,
+    "UAS_FRZ": 134
+  },
+  "warnings": [
+    "Official NATS AIP AIRAC 2026-08-06 data. Boundaries from official KML.",
+    "Helicopter routes remain curated (see src/data/helicopter-routes.ts).",
+    "Not for operational use. See DATA_SOURCES.md."
+  ],
+  "bbox": [
+    -1.5,
+    50.75,
+    1.0,
+    52.25
+  ]
+}
