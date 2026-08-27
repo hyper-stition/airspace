@@ -60,4 +60,4 @@ Helicopter routes are curated from CAA AIP ENR 1.2 and AIC 13/2018 (`src/data/he
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+MIT

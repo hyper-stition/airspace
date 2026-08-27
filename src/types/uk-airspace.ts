@@ -1,5 +1,4 @@
 // Normalised UK / ICAO-neutral airspace schema
-// Replaces the FAA-specific AirspaceProperties interface
 
 export type AirspaceCategory =
   | 'TMA'
