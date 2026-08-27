@@ -48,30 +48,9 @@ function DeckGLOverlay(props: MapboxOverlayProps) {
   return null;
 }
 
-// ---- Dark base map style (CARTO Dark Matter - free, no API key) ----
-// Note: use 1x PNG tiles (not @2x) — the retina variants lack CORS headers
-const MAP_STYLE = {
-  version: 8 as const,
-  sources: {
-    'carto-dark': {
-      type: 'raster' as const,
-      tiles: [
-        'https://a.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}.png',
-        'https://b.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}.png',
-        'https://c.basemaps.cartocdn.com/dark_matter/{z}/{x}/{y}.png',
-      ],
-      tileSize: 256,
-      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
-    },
-  },
-  layers: [{
-    id: 'carto-dark-layer',
-    type: 'raster' as const,
-    source: 'carto-dark',
-    minzoom: 0,
-    maxzoom: 22,
-  }],
-};
+// ---- Dark base map style (OpenFreeMap - free, no API key, CORS-open) ----
+// CARTO blocks cross-origin tile requests from GitHub Pages; OpenFreeMap does not.
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark';
 
 // ---- Layer visibility state type ----
 type LayerKey =
