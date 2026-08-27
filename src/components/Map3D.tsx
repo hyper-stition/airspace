@@ -11,6 +11,7 @@ import type { ProcessedVolume, AdsbAircraft } from '../types/uk-airspace';
 import { ControlPanel } from './ControlPanel';
 import { InfoPanel } from './InfoPanel';
 import { AdsbPanel } from './AdsbPanel';
+import { CompassWidget, ScaleBar } from './MapOverlays';
 import {
   CATEGORY_COLORS, HIGHLIGHT_COLORS, AIRCRAFT_COLORS, getCategoryEdge,
   type VisualMode,
@@ -541,6 +542,12 @@ export function Map3D() {
           <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 8 }}>{error.message}</div>
         </div>
       )}
+
+      {/* ---- Compass + 3D axes gizmo ---- */}
+      <CompassWidget bearing={viewState.bearing} pitch={viewState.pitch} />
+
+      {/* ---- Scale bar + coordinate readout ---- */}
+      <ScaleBar zoom={viewState.zoom} latitude={viewState.latitude} longitude={viewState.longitude} />
 
       {/* ---- Safety notice (bottom center) ---- */}
       <div style={{
