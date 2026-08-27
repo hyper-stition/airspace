@@ -34,8 +34,8 @@ export function useAirspaceData(
 
       try {
         const [geojsonRes, manifestRes] = await Promise.all([
-          fetch('/data/airspace.geojson', { signal: controller.signal }),
-          fetch('/data/manifest.json', { signal: controller.signal }),
+          fetch(`${import.meta.env.BASE_URL}data/airspace.geojson`, { signal: controller.signal }),
+          fetch(`${import.meta.env.BASE_URL}data/manifest.json`, { signal: controller.signal }),
         ]);
 
         if (!geojsonRes.ok) throw new Error(`Failed to load airspace data: ${geojsonRes.status}`);
